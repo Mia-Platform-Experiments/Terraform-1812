@@ -1,4 +1,7 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
-- ../../configuration
+  - ../../configuration
+  - python-1812.deployment.yml
+  - python-1812.service.yml
+  - python-1812.serviceaccount.yml
