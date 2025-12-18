@@ -1,0 +1,6 @@
+{"deployments": {"value": {
+  "my-azure-app-service": {
+    "webapp_name": "app-app-service-1812",
+    "deployed_service": "python-1812"
+  }
+}}}
