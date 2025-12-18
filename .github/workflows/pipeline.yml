@@ -1,0 +1,365 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+name: Deploy Workflow
+on: deployment
+jobs:
+  deploy:
+    name: Deploy to ${{ github.event.deployment.environment }} environment
+    concurrency: ${{ github.event.deployment.environment }}
+    permissions:
+      deployments: write
+      contents: write
+    runs-on: ubuntu-latest
+    container: miaplatform/mlp:2.1.0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Update deployment status (pending)
+        if: success()
+        uses: chrnorm/deployment-status@v2
+        with:
+          token: '${{ github.token }}'
+          state: 'pending'
+          deployment-id: ${{ github.event.deployment.id }}
+      - name: Provision infrastructure with Terraform
+        env:
+          TF_API_TOKEN: ${{ secrets.TF_API_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TERRAFORM_VERSION: 1.14.2
+          TERRAFORM_WORK_DIR: ${{ github.workspace }}/terraform-work
+          MODULES_BASE_DIR: ${{ github.workspace }}/manifests/terraform/environments/${{ github.event.deployment.environment }}
+          PROJECT_NAME: "Terraform 1812"
+        run: |
+          echo "==> Installing Git and jq"
+          apk add --quiet --no-cache git jq
+          
+          echo "==> Configuring Git credentials for GitHub"
+          git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
+          
+          echo "==> Calculating workspace name from project name"
+          WORKSPACE_NAME=$(echo "${PROJECT_NAME}" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
+          echo "Project name: ${PROJECT_NAME}"
+          echo "Workspace name: ${WORKSPACE_NAME}"
+          
+          echo "==> Installing Terraform CLI ${TERRAFORM_VERSION}"
+          wget -q https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip
+          unzip -q terraform_${TERRAFORM_VERSION}_linux_amd64.zip
+          mv terraform /usr/local/bin/
+          rm terraform_${TERRAFORM_VERSION}_linux_amd64.zip
+          terraform version
+          
+          echo "==> Configuring Terraform Cloud credentials"
+          mkdir -p ~/.terraform.d
+          cat > ~/.terraform.d/credentials.tfrc.json << EOF
+          {
+            "credentials": {
+              "app.terraform.io": {
+                "token": "${TF_API_TOKEN}"
+              }
+            }
+          }
+          EOF
+          
+          echo "==> Scanning for Terraform module configurations"
+          VARS_FILES=$(find ${MODULES_BASE_DIR} -type f -name "*.variables.tf" 2>/dev/null || true)
+          
+          if [ -z "$VARS_FILES" ]; then
+            echo "No Terraform modules found in ${MODULES_BASE_DIR}"
+            echo "Will proceed with empty configuration to allow resource cleanup"
+          else
+            echo "Found $(echo "$VARS_FILES" | wc -l) module configuration(s):"
+            for f in $VARS_FILES; do
+              echo "  - $(basename $f)"
+            done
+          fi
+          
+          echo "==> Creating working directory: ${TERRAFORM_WORK_DIR}"
+          mkdir -p ${TERRAFORM_WORK_DIR}
+          cd ${TERRAFORM_WORK_DIR}
+          
+          echo "==> Generating main.tf header with HCP Terraform configuration"
+          cat > main.tf << TFEOF
+          terraform {
+            cloud {
+              organization = "mia-platform"
+              workspaces {
+                name = "${WORKSPACE_NAME}"
+              }
+            }
+            required_providers {
+              azurerm = {
+                source  = "hashicorp/azurerm"
+                version = "~> 3.0"
+              }
+            }
+          }
+
+          provider "azurerm" {
+            features {}
+          }
+          TFEOF
+          
+          echo "==> Processing module configurations and generating module blocks"
+          # Initialize deployments JSON object
+          DEPLOYMENTS_JSON="{}"
+          
+          for VARS_FILE in $VARS_FILES; do
+            BASENAME=$(basename "$VARS_FILE")
+            MODULE_NAME="${BASENAME%.variables.tf}"
+            
+            echo ""
+            echo "Processing module: $MODULE_NAME"
+            echo "  Source file: $VARS_FILE"
+            
+            # Check if this is an app-service module based on folder path
+            IS_APP_SERVICE=false
+            if echo "$VARS_FILE" | grep -q '/app-service/'; then
+              echo "  Type: app-service (will be included in deployments)"
+              IS_APP_SERVICE=true
+            else
+              echo "  Type: infrastructure-only (no code deployment)"
+            fi
+            
+            # Extract variable names from the file (exclude _module_source)
+            echo "  Extracting variable names..."
+            VAR_NAMES=$(grep -E '^\s*variable\s+"' "$VARS_FILE" | sed -E 's/.*variable\s+"([^"]+)".*/\1/' | grep -v '^_module_source$')
+            VAR_COUNT=$(echo "$VAR_NAMES" | wc -w)
+            echo "  Found $VAR_COUNT variable(s): $(echo $VAR_NAMES | tr '\n' ' ')"
+            
+            # Transform and copy variables file with prefixed names
+            echo "  Transforming variables file with prefix '${MODULE_NAME}_'..."
+            sed -E \
+              -e "s/variable \"([^\"]+)\"/variable \"${MODULE_NAME}_\1\"/" \
+              -e "s/var\.([a-z_]+)/var.${MODULE_NAME}_\1/g" \
+              "$VARS_FILE" > "${TERRAFORM_WORK_DIR}/${BASENAME}"
+            echo "  Created: ${TERRAFORM_WORK_DIR}/${BASENAME}"
+            
+            # Extract module source from transformed variables file
+            echo "  Extracting module source..."
+            # Create a temporary directory with minimal terraform config to use console
+            CONSOLE_DIR=$(mktemp -d)
+            echo "  Debug: Created temp dir ${CONSOLE_DIR}"
+            cp "${TERRAFORM_WORK_DIR}/${BASENAME}" "${CONSOLE_DIR}/variables.tf"
+            echo "  Debug: Copied variables to ${CONSOLE_DIR}/variables.tf"
+            echo "  Debug: Running terraform console with var.${MODULE_NAME}__module_source"
+            cd "${CONSOLE_DIR}"
+            MODULE_SOURCE=$(echo "var.${MODULE_NAME}__module_source" | terraform console 2>&1 | tee /dev/stderr | tail -1 | tr -d '"')
+            CONSOLE_EXIT=$?
+
+            # Extract deployment info if app-service
+            if [ "$IS_APP_SERVICE" = true ]; then
+               echo "  Extracting deployment variables..."
+               SERVICE_NAME=$(echo "var.${MODULE_NAME}_service_name" | terraform console 2>&1 | tee /dev/stderr | tail -1 | tr -d '"')
+               DEPLOYED_SERVICE=$(echo "var.${MODULE_NAME}_deployed_service" | terraform console 2>&1 | tee /dev/stderr | tail -1 | tr -d '"')
+               
+               WEBAPP_NAME="app-${SERVICE_NAME}"
+               
+               echo "  Detected App Service configuration:"
+               echo "    Service Name: ${SERVICE_NAME}"
+               echo "    Deployed Service: ${DEPLOYED_SERVICE}"
+               echo "    Calculated WebApp Name: ${WEBAPP_NAME}"
+               
+               # Update DEPLOYMENTS_JSON
+               DEPLOYMENTS_JSON=$(echo "$DEPLOYMENTS_JSON" | jq --arg mod "$MODULE_NAME" --arg web "$WEBAPP_NAME" --arg svc "$DEPLOYED_SERVICE" '. + {($mod): {webapp_name: $web, deployed_service: $svc}}')
+            fi
+
+            cd - > /dev/null
+            echo "  Debug: terraform console exit code: ${CONSOLE_EXIT}"
+            echo "  Debug: Extracted value: '${MODULE_SOURCE}'"
+            rm -rf "${CONSOLE_DIR}"
+            
+            if [ -z "$MODULE_SOURCE" ] || [ "$CONSOLE_EXIT" -ne 0 ]; then
+              echo "ERROR: Failed to extract module source from $VARS_FILE"
+              echo "Debug: Content of variables file:"
+              head -20 "${TERRAFORM_WORK_DIR}/${BASENAME}"
+              exit 1
+            fi
+            echo "  Module source: ${MODULE_SOURCE}"
+            
+            # Generate module block
+            echo "  Generating module block..."
+            echo "" >> main.tf
+            echo "module \"${MODULE_NAME}\" {" >> main.tf
+            echo "  source = \"${MODULE_SOURCE}\"" >> main.tf
+            echo "" >> main.tf
+            
+            for VAR_NAME in $VAR_NAMES; do
+              echo "    Mapping: ${VAR_NAME} = var.${MODULE_NAME}_${VAR_NAME}"
+              echo "  ${VAR_NAME} = var.${MODULE_NAME}_${VAR_NAME}" >> main.tf
+            done
+            
+            echo "}" >> main.tf
+          done
+          
+          # Save deployments.json
+          echo "==> Saving deployment configuration"
+          echo "{\"deployments\": {\"value\": $DEPLOYMENTS_JSON}}" > "${TERRAFORM_WORK_DIR}/deployments.json"
+          echo "Generated deployments.json:"
+          cat "${TERRAFORM_WORK_DIR}/deployments.json"
+          
+          echo ""
+          echo "==> Generated main.tf content:"
+          cat main.tf
+          
+          echo ""
+          echo "==> Initializing Terraform with HCP Terraform backend"
+          terraform init
+          
+          echo ""
+          echo "==> Applying infrastructure changes (plan runs automatically in HCP Terraform)"
+          terraform apply -auto-approve
+      - name: Commit generated Terraform files
+        if: success()
+        env:
+          TERRAFORM_WORK_DIR: ${{ github.workspace }}/terraform-work
+          ENVIRONMENT: ${{ github.event.deployment.environment }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "==> Setting up clean git repository for commit"
+          GIT_REPO_DIR="/tmp/repo-for-commit"
+          
+          git config --global --add safe.directory "${GIT_REPO_DIR}"
+          git clone "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "${GIT_REPO_DIR}"
+          cd "${GIT_REPO_DIR}"
+          git checkout "${GITHUB_REF_NAME}"
+          
+          echo "==> Copying generated files to repository"
+          TARGET_DIR="${GIT_REPO_DIR}/environments/${ENVIRONMENT}/terraform"
+          mkdir -p "${TARGET_DIR}"
+          cp -v "${TERRAFORM_WORK_DIR}/main.tf" "${TARGET_DIR}/"
+          cp -v "${TERRAFORM_WORK_DIR}/"*.variables.tf "${TARGET_DIR}/" 2>/dev/null || echo "No variable files to copy"
+          cp -v "${TERRAFORM_WORK_DIR}/deployments.json" "${TARGET_DIR}/" 2>/dev/null || echo "No deployments.json to copy"
+          
+          echo "==> Configuring git identity"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          
+          echo "==> Staging changes"
+          git add "environments/${ENVIRONMENT}/terraform/"
+          
+          echo "==> Committing changes"
+          git diff --staged --quiet || git commit -m "chore: update terraform config for ${ENVIRONMENT} environment"
+          
+          echo "==> Pushing changes"
+          git push origin "${GITHUB_REF_NAME}"
+      - name: Install Azure CLI
+        run: |
+          apk add --quiet --no-cache python3 py3-pip gcc musl-dev python3-dev libffi-dev openssl-dev cargo make
+          pip3 install --break-system-packages --no-cache-dir azure-cli
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_HCPTFDEMO_CREDENTIALS }}
+      - name: Deploy application code to Azure App Services
+        env:
+          TERRAFORM_WORK_DIR: ${{ github.workspace }}/terraform-work
+          AZURE_STORAGE_ACCOUNT: ${{ secrets.AZURE_HCPTFDEMO_STORAGE_ACCOUNT }}
+          AZURE_STORAGE_CONTAINER: ${{ secrets.AZURE_HCPTFDEMO_STORAGE_CONTAINER }}
+          RESOURCE_GROUP: terraform-demo
+        run: |
+          echo "==> Installing dependencies"
+          apk add --quiet --no-cache jq
+          
+          echo "==> Reading deployment configuration"
+          DEPLOYMENTS_FILE="${TERRAFORM_WORK_DIR}/deployments.json"
+          
+          if [ ! -f "$DEPLOYMENTS_FILE" ]; then
+            echo "No deployments.json found. Skipping code deployment."
+            exit 0
+          fi
+          
+          echo "==> Deployment configuration:"
+          cat "$DEPLOYMENTS_FILE"
+          
+          # Extract the deployments object
+          DEPLOYMENTS=$(jq -r '.deployments.value' "$DEPLOYMENTS_FILE")
+          
+          # Check if there are any app services to deploy
+          if [ -z "$DEPLOYMENTS" ] || [ "$DEPLOYMENTS" = "{}" ] || [ "$DEPLOYMENTS" = "null" ]; then
+            echo "No app-service modules found. Skipping Azure code deployment."
+            exit 0
+          fi
+          
+          echo ""
+          echo "==> Deploying code to Azure App Services"
+          
+          # Loop through each app
+          for MODULE_NAME in $(echo "$DEPLOYMENTS" | jq -r 'keys[]'); do
+            WEBAPP_NAME=$(echo "$DEPLOYMENTS" | jq -r ".[\"$MODULE_NAME\"].webapp_name")
+            DEPLOYED_SERVICE=$(echo "$DEPLOYMENTS" | jq -r ".[\"$MODULE_NAME\"].deployed_service")
+            
+            echo ""
+            echo "Processing: $MODULE_NAME"
+            echo "  Web App: $WEBAPP_NAME"
+            echo "  Service: $DEPLOYED_SERVICE"
+            
+            # Download blob from storage
+            ZIP_FILE="${DEPLOYED_SERVICE}-latest.zip"
+            echo "  Downloading package from storage..."
+            az storage blob download \
+              --account-name "$AZURE_STORAGE_ACCOUNT" \
+              --container-name "$AZURE_STORAGE_CONTAINER" \
+              --name "${DEPLOYED_SERVICE}/${DEPLOYED_SERVICE}-latest.zip" \
+              --file "$ZIP_FILE" \
+              --auth-mode login
+            
+            # Deploy using Azure CLI
+            echo "  Deploying ZIP package to $WEBAPP_NAME..."
+            az webapp deploy \
+              --resource-group "$RESOURCE_GROUP" \
+              --name "$WEBAPP_NAME" \
+              --src-path "$ZIP_FILE" \
+              --type zip \
+              --track-status false
+            
+            echo "  ✓ Deployment completed for $WEBAPP_NAME"
+          done
+          
+          echo ""
+          echo "==> All deployments completed successfully"
+      - name: Deploy my app
+        if: ${{ false }} # TEMPORARY DISABLE KUBERNETES DEPLOYMENT STEP
+        env:
+          GIT_DEPTH: 1
+          ENVIRONMENT_VARIABLES_PREFIX: MIA_
+          BASE_PATH: ${{ github.workspace }}/configuration
+          OVERLAY_PATH: "${{ github.workspace }}/overlays/${{ github.event.deployment.environment }}"
+          DESTINATION_PATH: "${{ github.workspace }}/interpolated-files"
+          GENERATE_FILE: "${{ github.workspace }}/mlp.yaml"
+          VARIABLES_FILE: "${{ github.workspace }}/overlays/${{ github.event.deployment.environment }}/variables.env"
+          ENVIRONMENT_TO_DEPLOY: ${{ github.event.deployment.environment }}
+          ENVIRONMENT_PREFIX: ${{ github.event.deployment.environment }}_
+          DEPLOY_TYPE: ${{ github.event.deployment.payload.variables.DEPLOY_TYPE }}
+          FORCE_DEPLOY_WHEN_NO_SEMVER: ${{ github.event.deployment.payload.variables.FORCE_DEPLOY_WHEN_NO_SEMVER }}
+          KUBE_NAMESPACE: ${{ github.event.deployment.payload.variables.KUBE_NAMESPACE }}
+          KUBE_URL: ${{ secrets.KUBE_URL }}
+          KUBE_CA_PEM: ${{ secrets.KUBE_CA_PEM }}
+          KUBE_TOKEN: ${{ secrets.KUBE_TOKEN }}
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_TOKEN: ${{ secrets.NEXUS_TOKEN }}
+          NEXUS_URL: ${{ secrets.NEXUS_URL }}
+        run: |
+          export RELEASE_DATE="$(date -I'seconds' -u)"
+          tee /tmp/ca.pem > /dev/null << EOF
+          ${KUBE_CA_PEM}
+          EOF
+          mkdir ${DESTINATION_PATH}
+          test -f "${VARIABLES_FILE}" && set -a && source "${VARIABLES_FILE}"
+          test -f "${GENERATE_FILE}" && mlp generate -c "${GENERATE_FILE}" -e "${ENVIRONMENT_PREFIX}" -e "${ENVIRONMENT_VARIABLES_PREFIX}" -o "${OVERLAY_PATH}"
+          mlp hydrate "${BASE_PATH}" "${OVERLAY_PATH}"
+          mlp interpolate -e "${ENVIRONMENT_PREFIX}" -e "${ENVIRONMENT_VARIABLES_PREFIX}" -f "${BASE_PATH}" -o "${BASE_PATH}"
+          mlp interpolate -e "${ENVIRONMENT_PREFIX}" -e "${ENVIRONMENT_VARIABLES_PREFIX}" -f "${OVERLAY_PATH}" -o "${OVERLAY_PATH}"
+          mlp kustomize "${OVERLAY_PATH}" -o "${DESTINATION_PATH}/kustomize-output.yaml"
+          mlp deploy --ensure-namespace=false --server "${KUBE_URL}" --certificate-authority "/tmp/ca.pem" --token "${KUBE_TOKEN}" --deploy-type "${DEPLOY_TYPE}" --force-deploy-when-no-semver="${FORCE_DEPLOY_WHEN_NO_SEMVER}" -f "${DESTINATION_PATH}/kustomize-output.yaml" -n "${KUBE_NAMESPACE}"
+      - name: Update deployment status (success)
+        if: success()
+        uses: chrnorm/deployment-status@v2
+        with:
+          token: '${{ github.token }}'
+          state: 'success'
+          deployment-id: ${{ github.event.deployment.id }}
+      - name: Update deployment status (failure)
+        if: failure()
+        uses: chrnorm/deployment-status@v2
+        with:
+          token: '${{ github.token }}'
+          state: 'failure'
+          deployment-id: ${{ github.event.deployment.id }}
